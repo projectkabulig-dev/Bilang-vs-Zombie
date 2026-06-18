@@ -2082,14 +2082,14 @@ function closeModal(){
 function goHome(){
   document.getElementById('confirm-modal').classList.remove('show');
   if(state.egmaTimer) clearInterval(state.egmaTimer);
-  if(rnSpeech){ try{ rnSpeech.stop(); }catch(e){} rnSpeech=null; }
+  cancelRNListening();
   state = {};
   showGradeSelect();
 }
 function backToSessionsFromQuiz(){
   document.getElementById('confirm-modal').classList.remove('show');
   if(state.egmaTimer) clearInterval(state.egmaTimer);
-  if(rnSpeech){ try{ rnSpeech.stop(); }catch(e){} rnSpeech=null; }
+  cancelRNListening();
   if(currentLevel3Config){ showLevel3Landing(state.grade, currentLevel3Config); }
   else { showGradeSelect(); }
 }
@@ -2104,7 +2104,6 @@ var RN_NUMWORDS = {
 };
 
 var rnState = {};
-var rnSpeech = null;
 
 function startEGMA(grade, levelConfig){
   if(state.egmaTimer) clearInterval(state.egmaTimer);
@@ -2263,6 +2262,18 @@ function checkSpeechMatch(heardRaw, num){
   return false;
 }
 
+var rnSpeech = null;
+var rnSpeechSession = 0;   // incrementing id — invalidates stale/late callbacks after navigating away
+var rnSpeechTimeoutId = null;
+var rnSpeechSafetyId = null;
+
+function cancelRNListening(){
+  rnSpeechSession++;                       // anumang pending onresult/onend/timeout ay ma-ignore na
+  if(rnSpeechTimeoutId){ clearTimeout(rnSpeechTimeoutId); rnSpeechTimeoutId=null; }
+  if(rnSpeechSafetyId){ clearTimeout(rnSpeechSafetyId); rnSpeechSafetyId=null; }
+  if(rnSpeech){ try{ rnSpeech.stop(); }catch(e){} rnSpeech=null; }
+}
+
 function startListening(num){
   var SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
   if(!SpeechRec){
@@ -2280,6 +2291,9 @@ function startListening(num){
     return;
   }
 
+  cancelRNListening(); // ihinto/ikansela muna ang dating session (kung meron) bago magsimula ng bago
+  var mySession = rnSpeechSession;
+
   var micBtn = document.getElementById('rn-mic-btn');
   var status = document.getElementById('rn-mic-status');
   var heardEl = document.getElementById('rn-heard-text');
@@ -2294,6 +2308,36 @@ function startListening(num){
   rnSpeech.continuous = false;
 
   var allAlternatives = [];
+  var lastInterim = '';
+  var finished = false;
+
+  function finishListening(){
+    if(finished) return;
+    finished = true;
+    if(rnSpeechTimeoutId){ clearTimeout(rnSpeechTimeoutId); rnSpeechTimeoutId=null; }
+    if(rnSpeechSafetyId){ clearTimeout(rnSpeechSafetyId); rnSpeechSafetyId=null; }
+    if(mySession !== rnSpeechSession) return; // tumalon na ang user sa ibang screen — wag na ipakita dito
+
+    if(micBtn) micBtn.classList.remove('listening');
+
+    // kung walang final result na dumating, gamitin na lang ang huling interim na narinig
+    var heard = allAlternatives.length ? allAlternatives : (lastInterim ? [lastInterim] : []);
+    if(heard.length===0){
+      if(status) status.textContent = 'Hindi marinig. I-tap ulit ang mikropono.';
+      if(micBtn) micBtn.onclick = function(){ startListening(num); };
+      return;
+    }
+    var correct=false;
+    for(var i=0;i<heard.length;i++){
+      if(checkSpeechMatch(heard[i], num)){ correct=true; break; }
+    }
+    var display=heard[0];
+    if(heardEl) heardEl.textContent = '"'+display+'"';
+    if(status) status.textContent = correct ? 'Tama ang pagbasa! Magaling!' : 'Narinig: "'+display+'" — Mali';
+    setTimeout(function(){
+      if(mySession === rnSpeechSession) rnMark(correct);
+    }, 700);
+  }
 
   rnSpeech.onresult = function(e){
     var interim='';
@@ -2305,33 +2349,38 @@ function startListening(num){
         }
       } else { interim=e.results[i][0].transcript; }
     }
+    if(interim) lastInterim = interim;
     if(heardEl) heardEl.textContent = '"'+(allAlternatives[0]||interim)+'"';
   };
 
   rnSpeech.onend = function(){
-    if(micBtn) micBtn.classList.remove('listening');
-    if(allAlternatives.length===0){
-      if(status) status.textContent = 'Hindi marinig. I-tap ulit ang mikropono.';
-      if(micBtn) micBtn.onclick = function(){ startListening(num); };
-      return;
-    }
-    // Check ALL alternatives — if ANY matches, correct!
-    var correct=false;
-    for(var i=0;i<allAlternatives.length;i++){
-      if(checkSpeechMatch(allAlternatives[i], num)){ correct=true; break; }
-    }
-    var display=allAlternatives[0];
-    if(heardEl) heardEl.textContent = '"'+display+'"';
-    if(status) status.textContent = correct ? 'Tama ang pagbasa! Magaling!' : 'Narinig: "'+display+'" — Mali';
-    setTimeout(function(){ rnMark(correct); }, 700);
+    finishListening();
   };
 
   rnSpeech.onerror = function(e){
+    if(finished) return;
+    finished = true;
+    if(rnSpeechTimeoutId){ clearTimeout(rnSpeechTimeoutId); rnSpeechTimeoutId=null; }
+    if(rnSpeechSafetyId){ clearTimeout(rnSpeechSafetyId); rnSpeechSafetyId=null; }
+    if(mySession !== rnSpeechSession) return;
     if(micBtn){ micBtn.classList.remove('listening'); micBtn.onclick=function(){ startListening(num); }; }
     if(status) status.textContent = 'Error: '+e.error+'. I-tap ulit.';
   };
 
-  try{ rnSpeech.start(); }catch(e){
+  try{
+    rnSpeech.start();
+    // SAFETY-NET: kung 'di natapos sa loob ng 7s (mabagal na network/nag-hang ang browser),
+    // pilitin itong tapusin para hindi na manatili sa "Nakikinig..." magpakailanman
+    rnSpeechTimeoutId = setTimeout(function(){
+      if(finished || mySession!==rnSpeechSession) return;
+      if(status) status.textContent = 'Tapos na sa pakikinig, pinoproseso...';
+      try{ rnSpeech.stop(); }catch(e){}
+      // kung hindi rin tumigil ang browser sa loob ng 2.5s pa, i-proseso na lang manually
+      rnSpeechSafetyId = setTimeout(function(){
+        finishListening();
+      }, 2500);
+    }, 7000);
+  } catch(e){
     if(status) status.textContent = 'Hindi makasimula. Subukan ulit.';
   }
 }
